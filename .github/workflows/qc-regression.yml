@@ -1,4 +1,4 @@
-# QC regression pipeline (template). Copy as-is; set secrets/variables per project.
+# QC regression pipeline (template). Copy as-is; set secrets/variables per project before enabling.
 #
 #   Pull request : verify (types, lint, traceability, guard) + stabilize new/changed tests + @smoke  -> gate "pr"
 #   Nightly      : full @regression on the test environment                                         -> gate "nightly"
