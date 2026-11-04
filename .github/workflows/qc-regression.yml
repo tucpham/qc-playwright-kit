@@ -1,0 +1,124 @@
+# QC regression pipeline (template). Copy as-is; set secrets/variables per project.
+#
+#   Pull request : verify (types, lint, traceability, guard) + stabilize new/changed tests + @smoke  -> gate "pr"
+#   Nightly      : full @regression on the test environment                                         -> gate "nightly"
+#   Manual       : any gate, e.g. "release" before a release                                        -> gate of your choice
+#
+# Secrets:   ADMIN_USER, ADMIN_PASS, USER_USER, USER_PASS (one pair per role in project.config.ts)
+# Variables: TEST_ENV (e.g. staging)
+name: QC Regression
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 19 * * 1-5' # 02:00 Asia/Saigon, Mon-Fri
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: Quality gate
+        type: choice
+        options: [release, nightly, pr]
+        default: release
+      grep:
+        description: Test filter
+        default: '@regression'
+
+concurrency:
+  group: qc-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CI: 'true'
+  TEST_ENV: ${{ vars.TEST_ENV || 'staging' }}
+  ADMIN_USER: ${{ secrets.ADMIN_USER }}
+  ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+  USER_USER: ${{ secrets.USER_USER }}
+  USER_PASS: ${{ secrets.USER_PASS }}
+
+jobs:
+  verify:
+    name: Verify test code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run trace:check
+      - name: Guard against weakened tests
+        if: github.event_name == 'pull_request'
+        run: npm run guard -- --base origin/${{ github.base_ref }}
+        env:
+          QC_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'qc-approved') && '1' || '0' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: traceability
+          path: metrics/traceability.json
+          if-no-files-found: ignore
+
+  stabilize:
+    name: Stabilize new/changed tests
+    if: github.event_name == 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run stabilize:changed -- --base origin/${{ github.base_ref }} --runs 5
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stabilize-report
+          path: |
+            playwright-report
+            test-results
+          retention-days: 7
+
+  e2e:
+    name: E2E (${{ github.event_name == 'pull_request' && 'smoke' || 'regression' }})
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Run tests
+        run: npx playwright test --grep "$GREP"
+        env:
+          GREP: ${{ github.event_name == 'pull_request' && '@smoke' || inputs.grep || '@regression' }}
+      - name: Metrics + quality gate
+        if: always()
+        run: npm run metrics -- --gate "$GATE"
+        env:
+          GATE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.gate || 'nightly' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-report-${{ github.run_id }}
+          path: |
+            playwright-report
+            test-results/junit.xml
+            test-results/results.json
+            metrics
+          retention-days: 14
